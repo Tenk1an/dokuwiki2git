@@ -8,7 +8,7 @@ import os
 import subprocess
 import sys
 import time
-import urllib
+import urllib.parse
 
 USAGE = """
 dokuwiki2git converts dokuwiki data directory into a git repository containing
@@ -19,6 +19,11 @@ $ dokuwiki2git [options] /path/to/dokuwiki/data"""
 
 logging.basicConfig(level = logging.DEBUG, format = '%(levelname)s - %(message)s')
 log = logging.getLogger()
+windows = os.name == 'nt'
+fileOpenMode = 'rb'
+
+if windows:
+	fileOpenMode = 'rt'
 
 class Converter:
 	def __init__(self):
@@ -28,6 +33,7 @@ class Converter:
 		self.metadir = None
 		self.changelog = [] # (timestamp, ip, changetype, pagename, author, comment)
 		self.commands = [] # commands to run to create the git repository
+		self.createdDirs = set()
 		self.gitdir = 'gitdir'
 		self.users = {}
 		self.extension = '.txt'
@@ -40,11 +46,12 @@ class Converter:
 		for cmd, options in self.commands:
 			log.debug('CMD: %s' % cmd)
 			outputfile = options.get('stdout')
+			useShell = options.get('shell') or False
 			if outputfile:
 				with open(os.path.join(self.gitdir, outputfile), mode='w+b') as f:
-					ret = subprocess.call(cmd, stdout=f, cwd=self.gitdir)
+					ret = subprocess.call(cmd, stdout=f, cwd=self.gitdir, shell=useShell)
 			else:
-				ret = subprocess.call(cmd, cwd=self.gitdir)
+				ret = subprocess.call(cmd, cwd=self.gitdir, shell=useShell)
 			if ret != 0 and not options.get('ignore_exit', False):
 				raise RuntimeError('Command "%s" failed' % cmd)
 
@@ -53,11 +60,62 @@ class Converter:
 		parts = filename.rsplit('.', 3)
 		return parts[0], parts[1] # pagepath, filename
 
+	def add_created_dir(self, dirname: str):
+		self.createdDirs.add(dirname)
+		parts = dirname.rsplit(os.sep, 1)
+		while len(parts) > 1:
+			self.createdDirs.add(parts[0])
+			parts = parts[0].rsplit(os.sep, 1)
+	
+	def append_delete_commands(self, pagefile: str):
+		if windows:
+			# delete, leaving directories in place
+			self.commands.append((['git', 'rm', '--cached', '--quiet', pagefile], {'ignore_exit': True}))
+			self.commands.append((['del', '/F', pagefile], { 'shell': True }))
+		else:
+			self.commands.append((['git', 'rm', '--quiet', '--', pagefile], {'ignore_exit': True}))
+
+	def append_update_commands(self, pagefile: str, filename: str):
+		self.append_directory_create_commands(pagefile)
+		
+		if windows:
+			self.commands.append((['7z', 'x', '-aoa', '-so', filename], {'stdout': pagefile}))
+		else:
+			self.commands.append((['gunzip', '-c', filename], {'stdout': pagefile}))
+
+		if self.convert:
+			self.commands.append((['pandoc', '-f', 'dokuwiki', '-t', self.convert, '-o', pagefile, pagefile], {'ignore_exit': True}))
+		self.commands.append((['git', 'add', '--force', '--', pagefile], {}))
+
+	def append_media_copy_commands(self, fullfile: str, filename: str):
+		self.append_directory_create_commands(filename)
+		
+		if windows:
+			self.commands.append((['copy', '/Y', fullfile, filename], { 'shell': True }))
+		else:
+			self.commands.append((['cp', '--', fullfile, filename], {}))
+
+		self.commands.append((['git', 'add', '--force', '--', filename], {}))
+
+	def append_directory_create_commands(self, pagefile: str):
+		dirname = os.path.dirname(pagefile)
+		
+		if len(dirname) > 0:
+			if windows:
+				if dirname not in self.createdDirs:
+					self.commands.append((['mkdir', dirname], { 'shell': True }))
+					self.add_created_dir(dirname)
+			else:
+				self.commands.append((['mkdir', '-p', '--', dirname], {}))
+
+	def append_commit_commands(self, author: str, timestamp: str, message: str):
+		self.commands.append((['git', 'commit', '--quiet', '--author={}'.format(author), '--date={} +0000'.format(timestamp), '-m', message], {'ignore_exit': True}))
+
 	def has_changelog_entry(self, pagepath, timestamp):
 		for c in self.changelog:
 			ts = c[0]
 			pagename = c[3]
-			if timestamp == ts and pagepath == pagename.replace(':', '/'):
+			if timestamp == ts and pagepath == pagename.replace(':', os.sep):
 				return
 		log.warn('Attic contains "%s" timestamp %s, but is not referenced by changelog, skipping. Please report this!' % (pagepath, timestamp))
 
@@ -66,7 +124,7 @@ class Converter:
 
 		# Check that all referenced pages exist in attic
 		for c in self.changelog:
-			pagepath = c[3].replace(':', '/')
+			pagepath = c[3].replace(':', os.sep)
 			filename = os.path.join(self.atticdir, pagepath + '.%s.txt.gz' % c[0])
 			if not os.path.exists(filename):
 				log.warn('File "%s" does not exist, despite being in changelog, skipping' % filename)
@@ -84,20 +142,15 @@ class Converter:
 				email = self.users[user]['email']
 				user = self.users[user]['name']
 			author = '%s <%s>' % (user, email)
-			cmds = []
+			cmdCount = len(self.commands)
+			
 			if c[2] in ('C', 'E', 'e', 'R'): # create, edit, minor edit, restore
-				dirname = os.path.dirname(pagefile)
-				if len(dirname) > 0:
-					cmds.append((['mkdir', '-p', '--', dirname], {}))
-				cmds.append((['gunzip', '-c', filename], {'stdout': pagefile}))
-				if self.convert:
-					cmds.append((['pandoc', '-f', 'dokuwiki', '-t', self.convert, '-o', pagefile, pagefile], {'ignore_exit': True}))
-				cmds.append((['git', 'add', '--force', '--', pagefile], {}))
+				self.append_update_commands(pagefile, filename)
 			elif c[2] == 'D': # delete
-				cmds.append((['git', 'rm', '--quiet', '--', pagefile], {'ignore_exit': True}))
-			if cmds:
-				cmds.append((['git', 'commit', '--quiet', '--author={}'.format(author), '--date={} +0000'.format(timestamp), '-m', message], {'ignore_exit': True}))
-			self.commands.extend(cmds)
+				self.append_delete_commands(pagefile)
+
+			if len(self.commands) > cmdCount:
+				self.append_commit_commands(author, timestamp, message)
 
 		# check that all pages in attic have a matching changelog entry
 		for path, dirs, files in os.walk(self.atticdir):
@@ -126,13 +179,7 @@ class Converter:
 			for f in files:
 				fullfile = os.path.join(path, f)
 				filename = os.path.relpath(fullfile, self.datadir)
-				dirname = os.path.dirname(filename)
-				cmds = [
-					(['mkdir', '-p', '--', dirname], {}),
-					(['cp', '--', fullfile, filename], {}),
-					(['git', 'add', '--force', '--', filename], {})
-				]
-				self.commands.extend(cmds)
+				self.append_media_copy_commands(fullfile, filename)
 		self.commands.append((['git', 'commit', '--quiet', '--allow-empty', '--author=dokuwiki2git <dokuwiki2git@hoxu.github.com>', '-m', 'Import media files'], {}))
 
 	def read_meta(self):
@@ -150,16 +197,16 @@ class Converter:
 	def read_meta_page(self, pagepath, fullpath):
 		if pagepath in ('_dokuwiki', '_comments', '_media'):
 			return
-		pagename = pagepath.replace('/', ':')
+		pagename = pagepath.replace(os.sep, ':')
 		log.debug('Reading meta for page "%s"' % pagename)
-		with open(fullpath, 'rb') as f:
+		with open(fullpath, fileOpenMode) as f:
 			for line in f:
 				changeparts = line.split('\t')
 				if len(changeparts) == 8:
 					del changeparts[7]
 				log.debug(changeparts)
 				assert(len(changeparts) == 7)
-				assert(changeparts[3] == urllib.unquote(pagename))
+				assert(changeparts[3] == urllib.parse.unquote(pagename))
 				changeparts[3] = pagename
 				assert(changeparts[2] in ('C', 'D', 'E', 'e', 'R')) # create, delete, edit, minor edit, restore
 				self.changelog.append(changeparts)
@@ -168,7 +215,7 @@ class Converter:
 		log.info('Reading users.auth.php')
 		parentdir = os.path.abspath(os.path.join(self.datadir, os.pardir))
 		users_file = os.path.join(parentdir, 'conf', 'users.auth.php')
-		with open(users_file, 'rb') as f:
+		with open(users_file, fileOpenMode) as f:
 			for line in f:
 				if not line.startswith("#") and len(line) > 1:
 					userparts = line.split(':')
