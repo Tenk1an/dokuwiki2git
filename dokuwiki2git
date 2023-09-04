@@ -5,6 +5,7 @@ import fnmatch
 import logging
 import optparse
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -48,17 +49,8 @@ class Converter:
 		runCommands = 0
 
 		# run all commands
-		for cmd, options in self.commands:
-			log.debug('CMD: %s' % cmd)
-			outputfile = options.get('stdout')
-			useShell = options.get('shell') or False
-			if outputfile:
-				with open(os.path.join(self.gitdir, outputfile), mode='w+b') as f:
-					ret = subprocess.call(cmd, stdout=f, cwd=self.gitdir, shell=useShell)
-			else:
-				ret = subprocess.call(cmd, cwd=self.gitdir, shell=useShell)
-			if ret != 0 and not options.get('ignore_exit', False):
-				raise RuntimeError('Command "%s" failed' % cmd)
+		for command in self.commands:
+			command.execute();
 			
 			runCommands += 1
 			if not self.verbose:
@@ -77,49 +69,50 @@ class Converter:
 			self.createdDirs.add(parts[0])
 			parts = parts[0].rsplit(os.sep, 1)
 	
+	def append_call(self, cmd, outputfile: str=None, shell=False, ignore_exit=False):
+		self.commands.append(CallCommand(cmd, self.gitdir, outputfile, shell, ignore_exit))
+	
+	def append_command(self, command):
+		self.commands.append(command)
+
 	def append_delete_commands(self, pagefile: str):
 		if windows:
 			# delete, leaving directories in place
-			self.commands.append((['git', 'rm', '--cached', '--quiet', pagefile], {'ignore_exit': True}))
-			self.commands.append((['del', '/F', pagefile], { 'shell': True }))
+			self.append_call(['git', 'rm', '--cached', '--quiet', pagefile], ignore_exit=True)
+			targetpath = os.path.join(self.gitdir, pagefile)
+			self.append_command(DelFileCommand(targetpath))
 		else:
-			self.commands.append((['git', 'rm', '--quiet', '--', pagefile], {'ignore_exit': True}))
+			self.append_call(['git', 'rm', '--quiet', '--', pagefile], ignore_exit=True)
 
 	def append_update_commands(self, pagefile: str, filename: str):
 		self.append_directory_create_commands(pagefile)
 		
 		if windows:
-			self.commands.append((['7z', 'x', '-aoa', '-so', filename], {'stdout': pagefile}))
+			targetpath = os.path.join(self.gitdir, pagefile)
+			self.append_command(UnzipFileCommand(filename, targetpath, self.convert or False))
+			# self.append_call(['7z', 'x', '-aoa', '-so', filename], outputfile=pagefile)
 		else:
-			self.commands.append((['gunzip', '-c', filename], {'stdout': pagefile}))
+			self.append_call(['gunzip', '-c', filename], outputfile=pagefile)
 
 		if self.convert:
-			self.commands.append((['pandoc', '-f', 'dokuwiki', '-t', self.convert, '-o', pagefile, pagefile], {'ignore_exit': True}))
-		self.commands.append((['git', 'add', '--force', '--', pagefile], {}))
+			self.append_call(['pandoc', '-f', 'dokuwiki', '-t', self.convert, '-o', pagefile, pagefile], ignore_exit=True)
+		self.append_call(['git', 'add', '--force', '--', pagefile])
 
-	def append_media_copy_commands(self, fullfile: str, filename: str):
-		self.append_directory_create_commands(filename)
-		
-		if windows:
-			self.commands.append((['copy', '/Y', fullfile, filename], { 'shell': True }))
-		else:
-			self.commands.append((['cp', '--', fullfile, filename], {}))
-
-		self.commands.append((['git', 'add', '--force', '--', filename], {}))
+	def append_media_copy_commands(self, sourcepath: str, targetfile: str):
+		self.append_directory_create_commands(targetfile)
+		targetpath = os.path.join(self.gitdir, targetfile)
+		self.append_command(CopyFileCommand(sourcepath, targetpath))
+		self.append_call(['git', 'add', '--force', '--', targetfile])
 
 	def append_directory_create_commands(self, pagefile: str):
 		dirname = os.path.dirname(pagefile)
 		
 		if len(dirname) > 0:
-			if windows:
-				if dirname not in self.createdDirs:
-					self.commands.append((['mkdir', dirname], { 'shell': True }))
-					self.add_created_dir(dirname)
-			else:
-				self.commands.append((['mkdir', '-p', '--', dirname], {}))
+			fulldir = os.path.join(self.gitdir, dirname)
+			self.append_command(MakeDirCommand(fulldir))
 
-	def append_commit_commands(self, author: str, timestamp: str, message: str):
-		self.commands.append((['git', 'commit', '--quiet', '--author={}'.format(author), '--date={} +0000'.format(timestamp), '-m', message], {'ignore_exit': True}))
+	def append_commit_command(self, author: str, timestamp: str, message: str):
+		self.append_call(['git', 'commit', '--quiet', '--allow-empty', '--author={}'.format(author), '--date={} +0000'.format(timestamp), '-m', message], ignore_exit=True)
 
 	def has_changelog_entry(self, pagepath, timestamp):
 		for c in self.changelog:
@@ -160,7 +153,7 @@ class Converter:
 				self.append_delete_commands(pagefile)
 
 			if len(self.commands) > cmdCount:
-				self.append_commit_commands(author, timestamp, message)
+				self.append_commit_command(author, timestamp, message)
 
 		# check that all pages in attic have a matching changelog entry
 		for path, dirs, files in os.walk(self.atticdir):
@@ -171,8 +164,8 @@ class Converter:
 					self.has_changelog_entry(pagepath, timestamp)
 
 	def read_data(self):
-		self.commands.append((['git', 'init', '--quiet'], {}))
-		self.commands.append((['git', 'config', 'core.safecrlf', 'false'], {}))
+		self.append_call(['git', 'init', '--quiet'])
+		self.append_call(['git', 'config', 'core.safecrlf', 'false'])
 		# find user Real Name and email
 		self.read_user_data()
 		# go through data/meta
@@ -182,16 +175,16 @@ class Converter:
 		# go through data/attic, importing pages referenced by .changes in meta
 		self.read_attic()
 		self.read_media()
-		self.commands.append((['git', 'commit', '--quiet', '--allow-empty', '--author=dokuwiki2git <dokuwiki2git@hoxu.github.com>', '-m', 'Dokuwiki data imported by dokuwiki2git'], {}))
+		self.append_call(['git', 'commit', '--quiet', '--allow-empty', '--author=dokuwiki2git <dokuwiki2git@hoxu.github.com>', '-m', 'Dokuwiki data imported by dokuwiki2git'])
 
 	def read_media(self):
 		log.info('Reading media')
 		for path, dirs, files in os.walk(self.mediadir):
 			for f in files:
-				fullfile = os.path.join(path, f)
-				filename = os.path.relpath(fullfile, self.datadir)
-				self.append_media_copy_commands(fullfile, filename)
-		self.commands.append((['git', 'commit', '--quiet', '--allow-empty', '--author=dokuwiki2git <dokuwiki2git@hoxu.github.com>', '-m', 'Import media files'], {}))
+				sourcefile = os.path.join(path, f)
+				targetfile = os.path.relpath(sourcefile, self.datadir)
+				self.append_media_copy_commands(sourcefile, targetfile)
+		self.append_call(['git', 'commit', '--quiet', '--allow-empty', '--author=dokuwiki2git <dokuwiki2git@hoxu.github.com>', '-m', 'Import media files'])
 
 	def read_meta(self):
 		log.info('Reading meta')
@@ -210,7 +203,7 @@ class Converter:
 			return
 		pagename = pagepath.replace(os.sep, ':')
 		log.debug('Reading meta for page "%s"' % pagename)
-		with open(fullpath, fileOpenMode) as f:
+		with open(fullpath, fileOpenMode, encoding='utf-8') as f:
 			for line in f:
 				changeparts = line.split('\t')
 				if len(changeparts) == 8:
@@ -226,7 +219,7 @@ class Converter:
 		log.info('Reading users.auth.php')
 		parentdir = os.path.abspath(os.path.join(self.datadir, os.pardir))
 		users_file = os.path.join(parentdir, 'conf', 'users.auth.php')
-		with open(users_file, fileOpenMode) as f:
+		with open(users_file, fileOpenMode, encoding='utf-8') as f:
 			for line in f:
 				if not line.startswith("#") and len(line) > 1:
 					userparts = line.split(':')
@@ -274,6 +267,79 @@ class Converter:
 		self.atticdir = os.path.join(self.datadir, 'attic')
 		self.mediadir = os.path.join(self.datadir, 'media')
 		log.info('Using datadir: %s' % self.datadir)
+
+class MakeDirCommand:
+	def __init__(self, dirname: str):
+		self.dirname = dirname
+	
+	def execute(self):
+		if not os.path.exists(self.dirname):
+			log.debug('Creating directory: %s' % self.dirname)
+			os.makedirs(self.dirname, exist_ok=True)
+
+class DelFileCommand:
+	def __init__(self, filepath: str):
+		self.filepath = filepath
+	
+	def execute(self):
+		log.debug('Deleting file: %s' % self.filepath)
+		os.remove(self.filepath)
+
+class CopyFileCommand:
+	def __init__(self, sourcepath: str, targetpath: str):
+		self.sourcepath = sourcepath
+		self.targetpath = targetpath
+	
+	def execute(self):
+		log.debug('Copying file: %s' % self.sourcepath)
+		shutil.copy2(self.sourcepath, self.targetpath)
+
+class UnzipFileCommand:
+	def __init__(self, sourcepath: str, targetpath: str, clean=False):
+		self.sourcepath = sourcepath
+		self.targetpath = targetpath
+		self.clean = clean
+	
+	def execute(self):
+		cmd = ['7z', 'x', '-aoa', '-sccUTF-8', '-so', self.sourcepath]
+		try:
+			with open(self.targetpath, mode='w+t', encoding='utf-8') as f:
+				# with subprocess.Popen(cmd, stdout=subprocess.PIPE) as unzip:
+				# 	output = unzip.communicate()
+				# 	for line in output[0].decode('utf-8').splitlines():
+				with subprocess.Popen(cmd, stdout=subprocess.PIPE, encoding='utf-8') as unzip:
+					for line in unzip.stdout:
+						# There seems to be a bug in pandoc's table handling where a preceding line
+						# with just '\\' on it can make table headers on next line fail
+						if self.clean and line.strip() == '\\\\':
+							f.write('')
+						else:
+							f.write(line)
+
+				if unzip.returncode != 0:
+					raise RuntimeError('Unzip of %s failedCommand "%s" failed' % cmd)
+		except Exception as e:
+			log.error("Unzipping %s failed" % self.sourcepath)
+			raise e
+
+class CallCommand:
+	def __init__(self, cmd, gitdir, outputfile: str=None, shell=False, ignore_exit=False):
+		self.cmd = cmd
+		self.gitdir = gitdir
+		self.outputfile = outputfile
+		self.shell = shell or False
+		self.ignore_exit = ignore_exit or False
+	
+	def execute(self):
+		log.debug('CMD: %s' % self.cmd)
+		if self.outputfile:
+			with open(os.path.join(self.gitdir, self.outputfile), mode='w+b') as f:
+				ret = subprocess.call(self.cmd, stdout=f, cwd=self.gitdir, shell=self.shell)
+		else:
+			ret = subprocess.call(self.cmd, cwd=self.gitdir, shell=self.shell)
+
+		if ret != 0 and not self.ignore_exit:
+			raise RuntimeError('Command "%s" failed' % self.cmd)
 
 if __name__ == '__main__':
 	c = Converter()
