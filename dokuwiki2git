@@ -34,7 +34,6 @@ class Converter:
 		self.metadir = None
 		self.changelog = [] # (timestamp, ip, changetype, pagename, author, comment)
 		self.commands = [] # commands to run to create the git repository
-		self.createdDirs = set()
 		self.gitdir = 'gitdir'
 		self.users = {}
 		self.extension = '.txt'
@@ -56,18 +55,10 @@ class Converter:
 			if not self.verbose:
 				print('', end=f'\rCommands done {runCommands} / {totalCommands}')
 
-
 	def get_pagepath_and_timestamp(self, filename):
 		filename = os.path.relpath(filename, self.atticdir)
 		parts = filename.rsplit('.', 3)
 		return parts[0], parts[1] # pagepath, filename
-
-	def add_created_dir(self, dirname: str):
-		self.createdDirs.add(dirname)
-		parts = dirname.rsplit(os.sep, 1)
-		while len(parts) > 1:
-			self.createdDirs.add(parts[0])
-			parts = parts[0].rsplit(os.sep, 1)
 	
 	def append_call(self, cmd, outputfile: str=None, shell=False, ignore_exit=False):
 		self.commands.append(CallCommand(cmd, self.gitdir, outputfile, shell, ignore_exit))
@@ -76,13 +67,7 @@ class Converter:
 		self.commands.append(command)
 
 	def append_delete_commands(self, pagefile: str):
-		if windows:
-			# delete, leaving directories in place
-			self.append_call(['git', 'rm', '--cached', '--quiet', pagefile], ignore_exit=True)
-			targetpath = os.path.join(self.gitdir, pagefile)
-			self.append_command(DelFileCommand(targetpath))
-		else:
-			self.append_call(['git', 'rm', '--quiet', '--', pagefile], ignore_exit=True)
+		self.append_call(['git', 'rm', '--quiet', '--', pagefile], ignore_exit=True)
 
 	def append_update_commands(self, pagefile: str, filename: str):
 		self.append_directory_create_commands(pagefile)
@@ -276,14 +261,6 @@ class MakeDirCommand:
 		if not os.path.exists(self.dirname):
 			log.debug('Creating directory: %s' % self.dirname)
 			os.makedirs(self.dirname, exist_ok=True)
-
-class DelFileCommand:
-	def __init__(self, filepath: str):
-		self.filepath = filepath
-	
-	def execute(self):
-		log.debug('Deleting file: %s' % self.filepath)
-		os.remove(self.filepath)
 
 class CopyFileCommand:
 	def __init__(self, sourcepath: str, targetpath: str):
